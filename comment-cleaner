@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION='1.0.0'
+VERSION='1.1.0'
 
 usage() {
   cat <<'USAGE'
@@ -201,6 +201,11 @@ const typescript = findTypescriptModule(process.cwd());
 
 function hasNullByte(source) {
   return source.includes('\0');
+}
+
+function countLines(text) {
+  if (text === '') return 0;
+  return text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
 }
 
 function isSupportedFile(filePath, source) {
@@ -717,6 +722,7 @@ async function main() {
   let scanned = 0;
   let changed = 0;
   let removed = 0;
+  let linesRemoved = 0;
   let skipped = 0;
 
   for (const filePath of files) {
@@ -758,12 +764,17 @@ async function main() {
     const comments = result.commentsRemoved;
     changed += 1;
     removed += comments;
+    const lines = Math.max(0, countLines(source) - countLines(result.source));
+    linesRemoved += lines;
+
+    const commentLabel = `${comments} comment${comments === 1 ? '' : 's'}`;
+    const lineLabel = `${lines} line${lines === 1 ? '' : 's'}`;
 
     if (mode === 'clean') {
       await fsp.writeFile(filePath, result.source, 'utf8');
-      console.log(`cleaned ${relative} (${comments} comment${comments === 1 ? '' : 's'} removed)`);
+      console.log(`cleaned ${relative} (${commentLabel} removed, ${lineLabel} removed)`);
     } else {
-      console.log(`needs cleanup ${relative} (${comments} comment${comments === 1 ? '' : 's'} removable)`);
+      console.log(`needs cleanup ${relative} (${commentLabel} removable, ${lineLabel} removable)`);
     }
   }
 
@@ -771,6 +782,7 @@ async function main() {
   console.log(`Scanned: ${scanned}`);
   console.log(`${mode === 'check' ? 'Files requiring cleanup' : 'Files cleaned'}: ${changed}`);
   console.log(`${mode === 'check' ? 'Comments removable' : 'Comments removed'}: ${removed}`);
+  console.log(`${mode === 'check' ? 'Lines removable' : 'Lines removed'}: ${linesRemoved}`);
   console.log(`Skipped: ${skipped}`);
 
   if (mode === 'check' && changed > 0 && process.exitCode !== 2) {
