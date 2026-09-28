@@ -1,0 +1,785 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION='1.0.0'
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  comment-cleaner --check <file-or-directory> [...]
+  comment-cleaner --clean <file-or-directory> [...]
+
+Examples:
+  comment-cleaner --check .
+  comment-cleaner --clean .
+  comment-cleaner --check src/foo.ts src/bar.ts
+  comment-cleaner --clean src/foo.ts src/bar.ts
+
+--check scans files and reports removable comments without changing files.
+--clean removes ordinary comments while preserving known tool directives, shebangs,
+and required headers. Directory arguments are processed recursively.
+USAGE
+}
+
+MODE=""
+ARGS=()
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 2
+fi
+
+case "$1" in
+  --check)
+    MODE="check"
+    shift
+    ;;
+  --clean)
+    MODE="clean"
+    shift
+    ;;
+  --)
+    shift
+    if [[ $# -eq 0 ]]; then
+      usage
+      exit 2
+    fi
+    case "$1" in
+      check|clean)
+        MODE="$1"
+        shift
+        ;;
+      *)
+        echo "error: expected 'check' or 'clean' after '--'" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --version)
+    echo "comment-cleaner $VERSION"
+    exit 0
+    ;;
+  *)
+    echo "error: expected --check, --clean, or '-- check/clean'" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ $# -eq 0 ]]; then
+  echo "error: at least one file or directory is required" >&2
+  exit 2
+fi
+
+ARGS=("$@")
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "error: Node.js is required" >&2
+  exit 2
+fi
+
+exec node - "$MODE" "${ARGS[@]}" <<'NODE'
+'use strict';
+
+const fs = require('node:fs');
+const fsp = fs.promises;
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const Module = require('node:module');
+
+const mode = process.argv[2];
+const rawTargets = process.argv.slice(3);
+
+const DEFAULT_IGNORED_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.cache',
+  '.parcel-cache',
+  '.vite',
+  'target',
+  'out',
+  'vendor',
+]);
+
+const JS_TS_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+]);
+
+const SHELL_EXTENSIONS = new Set([
+  '.sh', '.bash', '.zsh', '.ksh', '.fish',
+]);
+
+const CONFIG_EXTENSIONS = new Set([
+  '.yaml', '.yml', '.toml',
+]);
+
+const KNOWN_SHELL_FILENAMES = new Set([
+  'Dockerfile',
+  'Makefile',
+]);
+
+const TOOL_DIRECTIVE_PATTERNS = [
+  /\beslint-disable(?:-next-line|-line)?\b/,
+  /\beslint-enable\b/,
+  /@ts-expect-error\b/,
+  /@ts-ignore\b/,
+  /@ts-nocheck\b/,
+  /@ts-check\b/,
+  /\bprettier-ignore\b/,
+  /\bprettier-ignore-start\b/,
+  /\bprettier-ignore-end\b/,
+];
+
+const MAGIC_COMMENT_PATTERNS = [
+  /webpack[A-Z]/,
+  /webpackChunkName\s*:/,
+  /webpackMode\s*:/,
+  /webpackInclude\s*:/,
+  /webpackExclude\s*:/,
+  /vite-ignore\b/,
+  /rollup[A-Z]/,
+];
+
+const REQUIRED_HEADER_PATTERNS = [
+  /SPDX-License-Identifier\s*:/i,
+  /@generated\b/i,
+  /auto[- ]generated\b/i,
+  /DO NOT EDIT/i,
+  /THIS FILE IS GENERATED/i,
+];
+
+function isPreservedComment(text) {
+  const normalized = text.replace(/^\/\/!?\s*/, '').replace(/^\/\*+\s*/, '').replace(/\s*\*\/$/, '');
+
+  if (/^\/\/\/?\s*<reference\b/i.test(text)) return true;
+  if (/^\/\/\/?\s*<amd-(module|dependency)\b/i.test(text)) return true;
+  if (/^\/\/\/?\s*<amd-module\b/i.test(text)) return true;
+  if (/^#!\//.test(text)) return true;
+
+  return (
+    TOOL_DIRECTIVE_PATTERNS.some((pattern) => pattern.test(text)) ||
+    MAGIC_COMMENT_PATTERNS.some((pattern) => pattern.test(text)) ||
+    REQUIRED_HEADER_PATTERNS.some((pattern) => pattern.test(text)) ||
+    /^eslint-env\b/i.test(normalized)
+  );
+}
+
+function findTypescriptModule(startDir) {
+  let current = path.resolve(startDir);
+
+  while (true) {
+    try {
+      return Module.createRequire(path.join(current, 'package.json'))('typescript');
+    } catch (_) {
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+
+  try {
+    return require('typescript');
+  } catch (_) {
+    return null;
+  }
+}
+
+const typescript = findTypescriptModule(process.cwd());
+
+function hasNullByte(source) {
+  return source.includes('\0');
+}
+
+function isSupportedFile(filePath, source) {
+  const name = path.basename(filePath);
+  const ext = path.extname(name).toLowerCase();
+
+  if (JS_TS_EXTENSIONS.has(ext) || SHELL_EXTENSIONS.has(ext) || CONFIG_EXTENSIONS.has(ext)) {
+    return true;
+  }
+
+  if (KNOWN_SHELL_FILENAMES.has(name)) {
+    return true;
+  }
+
+  const firstLine = source.split(/\r?\n/, 1)[0];
+  return /^#!\/.*\b(?:bash|sh|zsh|ksh|fish)\b/.test(firstLine);
+}
+
+function languageFor(filePath, source) {
+  const name = path.basename(filePath);
+  const ext = path.extname(name).toLowerCase();
+
+  if (JS_TS_EXTENSIONS.has(ext)) return 'typescript';
+  if (SHELL_EXTENSIONS.has(ext) || KNOWN_SHELL_FILENAMES.has(name)) return 'shell';
+  if (ext === '.yaml' || ext === '.yml') return 'yaml';
+  if (ext === '.toml') return 'toml';
+
+  const firstLine = source.split(/\r?\n/, 1)[0];
+  if (/^#!\/.*\b(?:bash|sh|zsh|ksh|fish)\b/.test(firstLine)) return 'shell';
+
+  return null;
+}
+
+function needsSeparator(before, after) {
+  return /[\p{L}\p{N}_$]/u.test(before) && /[\p{L}\p{N}_$]/u.test(after);
+}
+
+function getLineStart(source, position) {
+  return source.lastIndexOf('\n', position - 1) + 1;
+}
+
+function getLineEnd(source, position) {
+  if (source[position] === '\r' && source[position + 1] === '\n') return position + 2;
+  if (source[position] === '\n' || source[position] === '\r') return position + 1;
+  return position;
+}
+
+function getLineContentEnd(source, end) {
+  const newline = source.indexOf('\n', end);
+  return newline === -1 ? source.length : newline;
+}
+
+function isStandaloneComment(source, start, end) {
+  const lineStart = getLineStart(source, start);
+  const lineContentEnd = getLineContentEnd(source, end);
+  const prefix = source.slice(lineStart, start);
+  const suffix = source.slice(end, lineContentEnd).replace(/\r$/, '');
+
+  return /^[ \t]*$/.test(prefix) && /^[ \t]*$/.test(suffix);
+}
+
+function previousLineRange(source, start) {
+  if (start <= 0) return null;
+
+  const previousLineEnd = start - 1;
+  const previousLineStart = getLineStart(source, previousLineEnd);
+  const previousLineContent = source
+    .slice(previousLineStart, previousLineEnd)
+    .replace(/\r$/, '');
+
+  return {
+    start: previousLineStart,
+    end: start,
+    isBlank: /^[ \t]*$/.test(previousLineContent),
+  };
+}
+
+function nextLineRange(source, end) {
+  if (end >= source.length) return null;
+
+  const nextLineStart = end;
+  const nextLineEnd = source.indexOf('\n', nextLineStart);
+  const contentEnd = nextLineEnd === -1 ? source.length : nextLineEnd;
+  const content = source
+    .slice(nextLineStart, contentEnd)
+    .replace(/\r$/, '');
+
+  return {
+    start: nextLineStart,
+    end: nextLineEnd === -1 ? source.length : getLineEnd(source, nextLineEnd),
+    isBlank: /^[ \t]*$/.test(content),
+  };
+}
+
+function expandStandaloneCommentRange(source, start, end) {
+  const lineStart = getLineStart(source, start);
+  const lineEndIndex = source.indexOf('\n', end);
+  const lineEnd = lineEndIndex === -1 ? source.length : getLineEnd(source, lineEndIndex);
+
+  let expandedEnd = lineEnd;
+  const next = nextLineRange(source, lineEnd);
+
+  if (next?.isBlank) {
+    expandedEnd = next.end;
+  }
+
+  return {
+    start: lineStart,
+    end: expandedEnd,
+    replacement: '',
+  };
+}
+
+function expandInlineCommentRange(source, range) {
+  let start = range.start;
+  let end = range.end;
+
+  const lineStart = getLineStart(source, start);
+  const linePrefix = source.slice(lineStart, start);
+  const lineContentEnd = getLineContentEnd(source, end);
+
+  if (range.kind === 'line') {
+    if (/^[ \t]*$/.test(linePrefix)) {
+      return expandStandaloneCommentRange(source, start, end);
+    }
+
+    start -= linePrefix.match(/[ \t]*$/)?.[0].length ?? 0;
+    end = lineContentEnd;
+    return { start, end, replacement: '' };
+  }
+
+  const whitespaceBefore = source.slice(0, start).match(/[ \t]*$/)?.[0] ?? '';
+  const whitespaceAfter = source.slice(end, lineContentEnd).match(/^[ \t]*/)?.[0] ?? '';
+
+  start -= whitespaceBefore.length;
+  end += whitespaceAfter.length;
+
+  const before = source.slice(0, start).trimEnd();
+  const after = source.slice(end).trimStart();
+  const beforeChar = before.at(-1);
+  const afterChar = after.at(0);
+  const requiresSeparator = beforeChar && afterChar && needsSeparator(beforeChar, afterChar);
+
+  return {
+    start,
+    end,
+    replacement:
+      whitespaceBefore.length > 0 || whitespaceAfter.length > 0 || requiresSeparator
+        ? ' '
+        : '',
+  };
+}
+
+function applyRanges(source, ranges) {
+  if (ranges.length === 0) return source;
+
+  const transformed = ranges
+    .map((range) =>
+      isStandaloneComment(source, range.start, range.end)
+        ? expandStandaloneCommentRange(source, range.start, range.end)
+        : expandInlineCommentRange(source, range),
+    )
+    .sort((a, b) => a.start - b.start);
+
+  const merged = [];
+
+  for (const range of transformed) {
+    const previous = merged.at(-1);
+
+    if (previous && range.start <= previous.end) {
+      previous.end = Math.max(previous.end, range.end);
+      previous.replacement = '';
+      continue;
+    }
+
+    merged.push({ ...range });
+  }
+
+  let result = '';
+  let cursor = 0;
+
+  for (const range of merged) {
+    result += source.slice(cursor, range.start);
+    result += range.replacement;
+    cursor = range.end;
+  }
+
+  result += source.slice(cursor);
+
+  return result;
+}
+
+function collectTypeScriptComments(source) {
+  const sourceFile = typescript.createSourceFile(
+    'comment-cleaner.ts',
+    source,
+    typescript.ScriptTarget.Latest,
+    true,
+    typescript.ScriptKind.TS,
+  );
+
+  const comments = new Map();
+
+  function addRanges(ranges) {
+    for (const range of ranges ?? []) {
+      comments.set(`${range.pos}:${range.end}`, {
+        start: range.pos,
+        end: range.end,
+        kind: range.kind === typescript.SyntaxKind.SingleLineCommentTrivia ? 'line' : 'block',
+      });
+    }
+  }
+
+  function visit(node) {
+    addRanges(typescript.getLeadingCommentRanges(source, node.pos));
+    addRanges(typescript.getTrailingCommentRanges(source, node.end));
+    typescript.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+
+  return [...comments.values()].sort((a, b) => a.start - b.start);
+}
+
+function cleanTypeScript(source) {
+  if (!typescript) {
+    throw new Error('TypeScript/JavaScript files require the "typescript" package to be installed in the repository or available to Node.');
+  }
+
+  const ranges = collectTypeScriptComments(source).filter((range) => {
+    const text = source.slice(range.start, range.end);
+    return !isPreservedComment(text);
+  });
+
+  return {
+    source: applyRanges(source, ranges),
+    commentsRemoved: ranges.length,
+  };
+}
+
+function isWhitespace(ch) {
+  return ch === ' ' || ch === '\t';
+}
+
+function cleanHashLanguage(source, language) {
+  const lines = source.split(/(\r?\n)/);
+  const output = [];
+  let changed = false;
+  let removed = 0;
+  let firstContentLine = true;
+  let shellSingle = false;
+  let shellDouble = false;
+  let shellEscaped = false;
+  let tomlBasic = false;
+  let tomlLiteral = false;
+  let yamlSingle = false;
+  let yamlDouble = false;
+  let skipNextLineEnding = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const part = lines[index];
+
+    if (/^\r?\n$/.test(part)) {
+      if (skipNextLineEnding) {
+        skipNextLineEnding = false;
+        continue;
+      }
+      output.push(part);
+      continue;
+    }
+
+    const line = part;
+
+    if (language === 'shell' && firstContentLine && /^#!\//.test(line)) {
+      output.push(line);
+      firstContentLine = false;
+      continue;
+    }
+
+    if (line.trim() === '') {
+      output.push(line);
+      continue;
+    }
+
+    firstContentLine = false;
+
+    let commentIndex = -1;
+
+    if (language === 'shell') {
+      shellSingle = false;
+      shellDouble = false;
+      shellEscaped = false;
+
+      let braceDepth = 0;
+      for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i];
+        const next = line[i + 1];
+
+        if (shellEscaped) {
+          shellEscaped = false;
+          continue;
+        }
+
+        if (ch === '\\' && !shellSingle) {
+          shellEscaped = true;
+          continue;
+        }
+
+        if (ch === "'" && !shellDouble) {
+          shellSingle = !shellSingle;
+          continue;
+        }
+
+        if (ch === '"' && !shellSingle) {
+          shellDouble = !shellDouble;
+          continue;
+        }
+
+        if (!shellSingle && ch === '$' && next === '{') {
+          braceDepth += 1;
+          i += 1;
+          continue;
+        }
+
+        if (!shellSingle && ch === '}' && braceDepth > 0) {
+          braceDepth -= 1;
+          continue;
+        }
+
+        if (!shellSingle && !shellDouble && braceDepth === 0 && ch === '#') {
+          commentIndex = i;
+          break;
+        }
+      }
+    } else if (language === 'yaml') {
+      yamlSingle = false;
+      yamlDouble = false;
+
+      for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i];
+
+        if (ch === "'" && !yamlDouble) {
+          if (yamlSingle && line[i + 1] === "'") {
+            i += 1;
+          } else {
+            yamlSingle = !yamlSingle;
+          }
+          continue;
+        }
+
+        if (ch === '"' && !yamlSingle && line[i - 1] !== '\\') {
+          yamlDouble = !yamlDouble;
+          continue;
+        }
+
+        if (!yamlSingle && !yamlDouble && ch === '#' && (i === 0 || /\s/.test(line[i - 1]))) {
+          commentIndex = i;
+          break;
+        }
+      }
+    } else if (language === 'toml') {
+      tomlBasic = false;
+      tomlLiteral = false;
+
+      for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i];
+
+        if (ch === "'" && !tomlBasic) {
+          if (line[i + 1] === "'" && line[i + 2] === "'") {
+            tomlLiteral = !tomlLiteral;
+            i += 2;
+          } else {
+            tomlLiteral = !tomlLiteral;
+          }
+          continue;
+        }
+
+        if (ch === '"' && !tomlLiteral && line[i - 1] !== '\\') {
+          if (line[i + 1] === '"' && line[i + 2] === '"') {
+            tomlBasic = !tomlBasic;
+            i += 2;
+          } else {
+            tomlBasic = !tomlBasic;
+          }
+          continue;
+        }
+
+        if (!tomlBasic && !tomlLiteral && ch === '#') {
+          commentIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (commentIndex === -1) {
+      output.push(line);
+      continue;
+    }
+
+    const comment = line.slice(commentIndex);
+
+    if (/^#!\//.test(comment) || isPreservedComment(comment)) {
+      output.push(line);
+      continue;
+    }
+
+    let code = line.slice(0, commentIndex).replace(/[ \t]+$/, '');
+
+    if (code.trim() === '') {
+      changed = true;
+      removed += 1;
+      skipNextLineEnding = true;
+      continue;
+    }
+
+    if (code !== line) {
+      changed = true;
+      removed += 1;
+    }
+    output.push(code);
+  }
+
+  return { source: output.join(''), commentsRemoved: removed };
+}
+
+function cleanSource(filePath, source) {
+  const language = languageFor(filePath, source);
+
+  if (!language) return { source, supported: false, commentsRemoved: 0 };
+
+  if (language === 'typescript') {
+    const cleaned = cleanTypeScript(source);
+    return { source: cleaned.source, supported: true, commentsRemoved: cleaned.commentsRemoved };
+  }
+
+  const cleaned = cleanHashLanguage(source, language);
+  return { source: cleaned.source, supported: true, commentsRemoved: cleaned.commentsRemoved };
+}
+
+function findRepoRoot(startPath) {
+  const resolved = path.resolve(startPath);
+  let current = fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()
+    ? resolved
+    : path.dirname(resolved);
+
+  while (true) {
+    const gitPath = path.join(current, '.git');
+    if (fs.existsSync(gitPath)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function isGitIgnored(filePath) {
+  const repoRoot = findRepoRoot(filePath);
+  if (!repoRoot) return false;
+
+  const relative = path.relative(repoRoot, filePath);
+  const result = spawnSync(
+    'git',
+    ['-C', repoRoot, 'check-ignore', '--quiet', '--', relative],
+    { stdio: 'ignore' },
+  );
+
+  return result.status === 0;
+}
+
+async function collectFiles(targets) {
+  const files = new Set();
+
+  async function walk(candidate) {
+    const absolute = path.resolve(candidate);
+    const stat = await fsp.lstat(absolute);
+
+    if (stat.isSymbolicLink()) {
+      return;
+    }
+
+    if (stat.isFile()) {
+      files.add(absolute);
+      return;
+    }
+
+    if (!stat.isDirectory()) {
+      return;
+    }
+
+    const entries = await fsp.readdir(absolute, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (entry.isDirectory() && DEFAULT_IGNORED_DIRS.has(entry.name)) {
+        continue;
+      }
+
+      await walk(path.join(absolute, entry.name));
+    }
+  }
+
+  for (const target of targets) {
+    await walk(target);
+  }
+
+  return [...files].sort();
+}
+
+async function main() {
+  if (!['check', 'clean'].includes(mode)) {
+    throw new Error(`Unknown mode: ${mode}`);
+  }
+
+  const files = await collectFiles(rawTargets);
+
+  let scanned = 0;
+  let changed = 0;
+  let removed = 0;
+  let skipped = 0;
+
+  for (const filePath of files) {
+    if (isGitIgnored(filePath)) {
+      skipped += 1;
+      continue;
+    }
+
+    let source;
+    try {
+      source = await fsp.readFile(filePath, 'utf8');
+    } catch (error) {
+      console.error(`error: cannot read ${filePath}: ${error.message}`);
+      process.exitCode = 2;
+      continue;
+    }
+
+    if (hasNullByte(source) || !isSupportedFile(filePath, source)) {
+      skipped += 1;
+      continue;
+    }
+
+    scanned += 1;
+
+    let result;
+    try {
+      result = cleanSource(filePath, source);
+    } catch (error) {
+      console.error(`error: ${path.relative(process.cwd(), filePath)}: ${error.message}`);
+      process.exitCode = 2;
+      continue;
+    }
+
+    if (!result.supported || result.source === source) {
+      continue;
+    }
+
+    const relative = path.relative(process.cwd(), filePath) || filePath;
+    const comments = result.commentsRemoved;
+    changed += 1;
+    removed += comments;
+
+    if (mode === 'clean') {
+      await fsp.writeFile(filePath, result.source, 'utf8');
+      console.log(`cleaned ${relative} (${comments} comment${comments === 1 ? '' : 's'} removed)`);
+    } else {
+      console.log(`needs cleanup ${relative} (${comments} comment${comments === 1 ? '' : 's'} removable)`);
+    }
+  }
+
+  console.log('');
+  console.log(`Scanned: ${scanned}`);
+  console.log(`${mode === 'check' ? 'Files requiring cleanup' : 'Files cleaned'}: ${changed}`);
+  console.log(`${mode === 'check' ? 'Comments removable' : 'Comments removed'}: ${removed}`);
+  console.log(`Skipped: ${skipped}`);
+
+  if (mode === 'check' && changed > 0 && process.exitCode !== 2) {
+    process.exitCode = 1;
+  }
+}
+
+main().catch((error) => {
+  console.error(`error: ${error.message}`);
+  process.exitCode = 2;
+});
+NODE
