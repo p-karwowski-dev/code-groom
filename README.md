@@ -1,29 +1,29 @@
-# comment-cleaner
+# code-groom
 
-`comment-cleaner` is a small command-line tool for enforcing a **no-comments-in-code** convention by removing ordinary explanatory comments from source files while preserving comments that have a functional purpose.
+`code-groom` is a small command-line tool for enforcing a **no-comments-in-code** convention by removing ordinary explanatory comments from source files while preserving comments that have a functional purpose.
 
 ## Installation
 
 Make the script executable:
 
 ```bash
-chmod +x comment-cleaner
+chmod +x code-groom
 ```
 
 ## Usage
 
 ```text
 Usage:
-  comment-cleaner --check <file-or-directory> [...]
-  comment-cleaner --clean <file-or-directory> [...]
-  comment-cleaner -- check <file-or-directory> [...]
-  comment-cleaner -- clean <file-or-directory> [...]
+  code-groom --check <file-or-directory> [...]
+  code-groom --clean <file-or-directory> [...]
+  code-groom -- check <file-or-directory> [...]
+  code-groom -- clean <file-or-directory> [...]
 
 Examples:
-  comment-cleaner --check .
-  comment-cleaner --clean .
-  comment-cleaner -- check src/foo.ts src/bar.ts
-  comment-cleaner -- clean src/foo.ts src/bar.ts
+  code-groom --check .
+  code-groom --clean .
+  code-groom -- check src/foo.ts src/bar.ts
+  code-groom -- clean src/foo.ts src/bar.ts
 ```
 
 Directory arguments are processed recursively through all nested directories.

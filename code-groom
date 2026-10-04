@@ -6,14 +6,14 @@ VERSION='1.1.0'
 usage() {
   cat <<'USAGE'
 Usage:
-  comment-cleaner --check <file-or-directory> [...]
-  comment-cleaner --clean <file-or-directory> [...]
+  code-groom --check <file-or-directory> [...]
+  code-groom --clean <file-or-directory> [...]
 
 Examples:
-  comment-cleaner --check .
-  comment-cleaner --clean .
-  comment-cleaner --check src/foo.ts src/bar.ts
-  comment-cleaner --clean src/foo.ts src/bar.ts
+  code-groom --check .
+  code-groom --clean .
+  code-groom --check src/foo.ts src/bar.ts
+  code-groom --clean src/foo.ts src/bar.ts
 
 --check scans files and reports removable comments without changing files.
 --clean removes ordinary comments while preserving known tool directives, shebangs,
@@ -61,7 +61,7 @@ case "$1" in
     exit 0
     ;;
   --version)
-    echo "comment-cleaner $VERSION"
+    echo "code-groom $VERSION"
     exit 0
     ;;
   *)
@@ -400,7 +400,7 @@ function applyRanges(source, ranges) {
 
 function collectTypeScriptComments(source) {
   const sourceFile = typescript.createSourceFile(
-    'comment-cleaner.ts',
+    'code-groom.ts',
     source,
     typescript.ScriptTarget.Latest,
     true,
